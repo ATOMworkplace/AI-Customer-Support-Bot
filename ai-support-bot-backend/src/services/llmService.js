@@ -1,6 +1,7 @@
 const axios = require('axios');
 const { llm } = require('../config');
 const scenarios = require('../data/scenarios.json');
+const cosineSimilarity = require('cosine-similarity');
 
 const PROMPTS = {
   intentClassification: `
@@ -11,7 +12,7 @@ const PROMPTS = {
     - FAQ_QUESTION
     - REQUEST_FOR_HUMAN
     - COMPLAINT
-    - SUMMARIZE_CONVERSATION (e.g., "summarize this", "give me a summary", "tl;dr")
+    - SUMMARIZE_CONVERSATION
     - CHITCHAT
     - UNKNOWN
     
@@ -27,19 +28,6 @@ const PROMPTS = {
     Analyze the sentiment of the following user query. Classify it as 'positive', 'neutral', or 'negative'.
     User Query: "{userQuery}"
     Respond with ONLY a single JSON object. Example: {"sentiment": "neutral"}
-  `,
-  faqFinder: `
-    You are a semantic search expert. Your task is to find the single best matching FAQ from the provided list for the given user query.
-    Review the list of available questions and the user's query.
-    Respond with the exact and complete text of the matching question from the list.
-    If no question from the list is a good semantic match for the user's query, you MUST respond with the single word "NONE".
-
-    Available Questions:
-    ---
-    {faqQuestions}
-    ---
-
-    User Query: "{userQuery}"
   `,
   contextualAnswer: `
     You are {persona}. A user asked the following query: "{userQuery}".
@@ -68,18 +56,19 @@ const PROMPTS = {
   `
 };
 
-const _callLLM = async (messages, temperature = 0.1, max_tokens = 250) => {
-  if (!llm.apiKey || !llm.apiEndpoint) {
-    throw new Error('LLM API Key or Endpoint is not configured.');
+const embeddingCache = {};
+const SIMILARITY_THRESHOLD = 0.8;
+
+const createEmbedding = async (text) => {
+  if (!llm.apiKey || !process.env.LLM_EMBEDDING_ENDPOINT) {
+    throw new Error('LLM API Key or Embedding Endpoint is not configured.');
   }
   try {
     const response = await axios.post(
-      llm.apiEndpoint,
+      process.env.LLM_EMBEDDING_ENDPOINT,
       {
-        model: 'gpt-3.5-turbo',
-        messages,
-        temperature,
-        max_tokens,
+        input: text,
+        model: 'text-embedding-ada-002',
       },
       {
         headers: {
@@ -87,6 +76,23 @@ const _callLLM = async (messages, temperature = 0.1, max_tokens = 250) => {
           'Authorization': `Bearer ${llm.apiKey}`,
         },
       }
+    );
+    return response.data.data[0].embedding;
+  } catch (error) {
+    console.error('Error creating embedding:', error.response ? error.response.data : error.message);
+    throw new Error('Failed to create text embedding.');
+  }
+};
+
+const _callLLM = async (messages, temperature = 0.1, max_tokens = 250) => {
+  if (!llm.apiKey || !llm.apiEndpoint) {
+    throw new Error('LLM API Key or Endpoint is not configured.');
+  }
+  try {
+    const response = await axios.post(
+      llm.apiEndpoint,
+      { model: 'gpt-3.5-turbo', messages, temperature, max_tokens },
+      { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${llm.apiKey}` } }
     );
     return response.data.choices[0].message.content.trim();
   } catch (error) {
@@ -124,22 +130,40 @@ const analyzeSentiment = async (userQuery) => {
 
 const findRelevantFAQ = async (userQuery, scenario) => {
   const scenarioData = scenarios[scenario];
-  if (!scenarioData) {
-    throw new Error(`Scenario "${scenario}" not found.`);
+  if (!scenarioData) throw new Error(`Scenario "${scenario}" not found.`);
+
+  if (!embeddingCache[scenario]) {
+    console.log(`Creating and caching embeddings for scenario: ${scenario}`);
+    const questions = scenarioData.faqs.map(f => f.question);
+    const embeddings = await Promise.all(questions.map(q => createEmbedding(q)));
+    embeddingCache[scenario] = scenarioData.faqs.map((faq, index) => ({
+      ...faq,
+      embedding: embeddings[index]
+    }));
   }
-  const faqQuestions = scenarioData.faqs.map(f => f.question).join('\n');
-  const prompt = PROMPTS.faqFinder
-    .replace('{faqQuestions}', faqQuestions)
-    .replace('{userQuery}', userQuery);
-  const messages = [{ role: 'system', content: prompt }];
-  return await _callLLM(messages, 0.0, 100);
+
+  const queryEmbedding = await createEmbedding(userQuery);
+  
+  let bestMatch = { score: -1, faq: null };
+
+  for (const faq of embeddingCache[scenario]) {
+    const score = cosineSimilarity(queryEmbedding, faq.embedding);
+    if (score > bestMatch.score) {
+      bestMatch = { score, faq };
+    }
+  }
+
+  if (bestMatch.score >= SIMILARITY_THRESHOLD) {
+    console.log(`Found best match with score ${bestMatch.score}: "${bestMatch.faq.question}"`);
+    return bestMatch.faq.question;
+  }
+  
+  return 'NONE';
 };
 
 const getAnswerFromContext = async (userQuery, faqEntry, scenario) => {
   const scenarioData = scenarios[scenario];
-  if (!scenarioData) {
-    throw new Error(`Scenario "${scenario}" not found.`);
-  }
+  if (!scenarioData) throw new Error(`Scenario "${scenario}" not found.`);
   const { persona } = scenarioData;
   const prompt = PROMPTS.contextualAnswer
     .replace('{persona}', persona)
@@ -152,9 +176,7 @@ const getAnswerFromContext = async (userQuery, faqEntry, scenario) => {
 
 const getGeneralResponse = async (userQuery, conversationHistory, scenario) => {
   const scenarioData = scenarios[scenario];
-  if (!scenarioData) {
-    throw new Error(`Scenario "${scenario}" not found.`);
-  }
+  if (!scenarioData) throw new Error(`Scenario "${scenario}" not found.`);
   const { persona } = scenarioData;
   const systemPrompt = PROMPTS.generalResponse.replace('{persona}', persona);
   const messages = [
