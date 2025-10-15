@@ -9,6 +9,9 @@ const db = new sqlite3.Database(databasePath, (err) => {
     db.run(`
       CREATE TABLE IF NOT EXISTS sessions (
         sessionId TEXT PRIMARY KEY,
+        scenario TEXT NOT NULL,
+        state TEXT DEFAULT 'IDLE',
+        context TEXT DEFAULT '{}',
         createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);

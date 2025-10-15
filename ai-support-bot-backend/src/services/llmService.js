@@ -1,20 +1,19 @@
 const axios = require('axios');
 const { llm } = require('../config');
-const faqs = require('../data/faqs.json');
+const scenarios = require('../data/scenarios.json');
 
-// --- Prompt Engineering Hub ---
-// Storing all prompts here makes them easier to manage and refine.
 const PROMPTS = {
   intentClassification: `
     You are an intent classification expert for a customer support bot. 
     Analyze the user's query and the last two messages of the conversation history. 
     Classify the user's primary intent into one of these specific categories:
-    - GREETING (e.g., "hi", "hello", "how are you?")
-    - FAQ_QUESTION (e.g., "what are your shipping options?", "how do I track my order?")
-    - REQUEST_FOR_HUMAN (e.g., "I need to speak to a person", "connect me to an agent")
-    - COMPLAINT (e.g., "this is unacceptable", "my order is damaged", "I'm very angry")
-    - CHITCHAT (e.g., "what's the weather like?", "tell me a joke", non-support related questions)
-    - UNKNOWN (if it does not fit any other category)
+    - GREETING
+    - FAQ_QUESTION
+    - REQUEST_FOR_HUMAN
+    - COMPLAINT
+    - SUMMARIZE_CONVERSATION (e.g., "summarize this", "give me a summary", "tl;dr")
+    - CHITCHAT
+    - UNKNOWN
     
     Conversation History (last 2 messages):
     {history}
@@ -29,15 +28,27 @@ const PROMPTS = {
     User Query: "{userQuery}"
     Respond with ONLY a single JSON object. Example: {"sentiment": "neutral"}
   `,
-  answerGeneration: `
-    You are a friendly and helpful customer support assistant for an online apparel and accessories store. 
-    Your goal is to respond to the user based ONLY on the provided FAQs. This includes answering direct questions and responding appropriately to common greetings.
-    If the user's query cannot be answered or handled using the information in the FAQs, you MUST respond with the exact string "[ESCALATE]". 
-    Do not make up answers. Be concise and professional.
+  faqFinder: `
+    You are a semantic search expert. Your task is to find the single best matching FAQ from the provided list for the given user query.
+    Review the list of available questions and the user's query.
+    Respond with the exact and complete text of the matching question from the list.
+    If no question from the list is a good semantic match for the user's query, you MUST respond with the single word "NONE".
 
-    --- FAQs ---
-    {faqString}
-    --- End of FAQs ---
+    Available Questions:
+    ---
+    {faqQuestions}
+    ---
+
+    User Query: "{userQuery}"
+  `,
+  contextualAnswer: `
+    You are {persona}. A user asked the following query: "{userQuery}".
+    The most relevant piece of information from your knowledge base is this question-answer pair:
+    Q: {faq_question}
+    A: {faq_answer}
+
+    Using ONLY this information, provide a direct and helpful answer to the user's original query. 
+    Adopt the tone of your persona. Do not say "Based on the information...". Just answer the question naturally.
   `,
   conversationSummary: `
     You are a helpful assistant who summarizes conversations for customer support agents.
@@ -49,22 +60,26 @@ const PROMPTS = {
 
     Summary:
   `,
+  generalResponse: `
+    You are {persona}. The user has asked a question that is not in your standard FAQ document. 
+    Answer their general question or chitchat in a helpful and conversational manner, keeping your persona in mind.
+    Do not mention that you are an AI or that you are looking at an FAQ document. Just answer naturally.
+    If the question is inappropriate, too complex, asks for personal opinions, or is completely unrelated to your business persona, you must politely decline to answer and gently guide them back to your main function as a customer support assistant.
+  `
 };
 
-// A private helper function to standardize calls to the LLM API.
-const _callLLM = async (messages, temperature = 0.2, max_tokens = 150) => {
+const _callLLM = async (messages, temperature = 0.1, max_tokens = 250) => {
   if (!llm.apiKey || !llm.apiEndpoint) {
     throw new Error('LLM API Key or Endpoint is not configured.');
   }
-
   try {
     const response = await axios.post(
       llm.apiEndpoint,
       {
-        model: 'gpt-3.5-turbo', // Or your preferred model
-        messages: messages,
-        temperature: temperature,
-        max_tokens: max_tokens,
+        model: 'gpt-3.5-turbo',
+        messages,
+        temperature,
+        max_tokens,
       },
       {
         headers: {
@@ -80,81 +95,92 @@ const _callLLM = async (messages, temperature = 0.2, max_tokens = 150) => {
   }
 };
 
-/**
- * Classifies the user's intent based on their query and recent history.
- * @returns {Promise<string>} The classified intent (e.g., 'FAQ_QUESTION').
- */
 const classifyIntent = async (userQuery, conversationHistory) => {
   const recentHistory = conversationHistory.slice(-2).map(msg => `${msg.role}: ${msg.content}`).join('\n');
   const prompt = PROMPTS.intentClassification
     .replace('{history}', recentHistory || 'No history yet.')
     .replace('{userQuery}', userQuery);
-
   const messages = [{ role: 'system', content: prompt }];
   const response = await _callLLM(messages, 0.1, 50);
-
   try {
     const jsonResponse = JSON.parse(response);
     return jsonResponse.intent || 'UNKNOWN';
   } catch (error) {
-    console.error('Failed to parse intent JSON:', response);
     return 'UNKNOWN';
   }
 };
 
-/**
- * Analyzes the sentiment of the user's query.
- * @returns {Promise<string>} The classified sentiment (e.g., 'negative').
- */
 const analyzeSentiment = async (userQuery) => {
   const prompt = PROMPTS.sentimentAnalysis.replace('{userQuery}', userQuery);
   const messages = [{ role: 'system', content: prompt }];
   const response = await _callLLM(messages, 0.1, 50);
-  
   try {
     const jsonResponse = JSON.parse(response);
     return jsonResponse.sentiment || 'neutral';
   } catch (error) {
-    console.error('Failed to parse sentiment JSON:', response);
     return 'neutral';
   }
 };
 
-/**
- * Generates a direct answer to a user's query based on FAQs.
- * @returns {Promise<string>} The AI-generated answer.
- */
-const getAnswer = async (userQuery, conversationHistory) => {
-  const faqString = faqs.map(f => `Q: ${f.question}\nA: ${f.answer}`).join('\n\n');
-  const systemPrompt = PROMPTS.answerGeneration.replace('{faqString}', faqString);
-  
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    ...conversationHistory,
-    { role: 'user', content: userQuery }
-  ];
-
-  return await _callLLM(messages, 0.3, 200);
+const findRelevantFAQ = async (userQuery, scenario) => {
+  const scenarioData = scenarios[scenario];
+  if (!scenarioData) {
+    throw new Error(`Scenario "${scenario}" not found.`);
+  }
+  const faqQuestions = scenarioData.faqs.map(f => f.question).join('\n');
+  const prompt = PROMPTS.faqFinder
+    .replace('{faqQuestions}', faqQuestions)
+    .replace('{userQuery}', userQuery);
+  const messages = [{ role: 'system', content: prompt }];
+  return await _callLLM(messages, 0.0, 100);
 };
 
-/**
- * Summarizes a conversation for escalation to a human agent.
- * @returns {Promise<string>} A one-sentence summary.
- */
-const summarizeConversation = async (conversationHistory) => {
+const getAnswerFromContext = async (userQuery, faqEntry, scenario) => {
+  const scenarioData = scenarios[scenario];
+  if (!scenarioData) {
+    throw new Error(`Scenario "${scenario}" not found.`);
+  }
+  const { persona } = scenarioData;
+  const prompt = PROMPTS.contextualAnswer
+    .replace('{persona}', persona)
+    .replace('{userQuery}', userQuery)
+    .replace('{faq_question}', faqEntry.question)
+    .replace('{faq_answer}', faqEntry.answer);
+  const messages = [{ role: 'system', content: prompt }];
+  return await _callLLM(messages, 0.3, 250);
+};
+
+const getGeneralResponse = async (userQuery, conversationHistory, scenario) => {
+  const scenarioData = scenarios[scenario];
+  if (!scenarioData) {
+    throw new Error(`Scenario "${scenario}" not found.`);
+  }
+  const { persona } = scenarioData;
+  const systemPrompt = PROMPTS.generalResponse.replace('{persona}', persona);
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...conversationHistory.slice(-4),
+    { role: 'user', content: userQuery }
+  ];
+  return await _callLLM(messages, 0.7, 250);
+};
+
+const summarizeConversation = async (conversationHistory, context = {}) => {
   if (conversationHistory.length === 0) {
     return "User initiated a chat but did not provide details.";
   }
+  const contextString = Object.keys(context).length > 0 ? `\n\nCollected Data:\n${JSON.stringify(context, null, 2)}` : '';
   const historyString = conversationHistory.map(msg => `${msg.role}: ${msg.content}`).join('\n');
-  const prompt = PROMPTS.conversationSummary.replace('{history}', historyString);
+  const prompt = PROMPTS.conversationSummary.replace('{history}', historyString + contextString);
   const messages = [{ role: 'system', content: prompt }];
   return await _callLLM(messages, 0.5, 100);
 };
 
-
 module.exports = {
   classifyIntent,
   analyzeSentiment,
-  getAnswer,
+  findRelevantFAQ,
+  getAnswerFromContext,
+  getGeneralResponse,
   summarizeConversation,
 };
